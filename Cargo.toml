@@ -1,0 +1,9 @@
+[package]
+name = "oxide-fleet"
+version = "0.1.0"
+edition = "2021"
+description = "Fleet coordination layer for the Flux→PTX distributed GPU runtime. Agent discovery, capability negotiation, workload distribution, and rhythm-based optimization."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/oxide-fleet"
+keywords = ["fleet", "gpu", "agent", "distributed", "cuda"]
+categories = ["concurrency", "network-programming"]
