@@ -1,120 +1,191 @@
 # oxide-fleet
 
-> Distributed GPU orchestration through capability negotiation and rhythm-aware workload placement.
+> **Fleet coordination layer for the Flux→PTX distributed GPU runtime.**
 
-## Background Theory
+[![Crates.io](https://img.shields.io/crates/v/oxide-fleet)](https://crates.io/crates/oxide-fleet)
+[![Docs.rs](https://docs.rs/oxide-fleet/badge.svg)](https://docs.rs/oxide-fleet)
+[![License](https://img.shields.io/crates/l/oxide-fleet)](LICENSE)
 
-Modern GPU clusters are not homogeneous. A single datacenter may contain V100s, A100s, H100s, and edge-class GPUs, each with different compute capabilities, memory capacities, and specialized features. Treating them as identical resources leads to fragmentation, load imbalance, and failed kernel launches.
+---
 
-The theoretical foundation of `oxide-fleet` is **capability-based resource allocation**. Instead of scheduling work to "a GPU," we schedule to "an agent that can compile Flux to PTX, has SM 8.0+, 8GB+ VRAM, and is currently online." This transforms scheduling from a naming problem into a constraint-satisfaction problem.
+## Table of Contents
 
-A secondary foundation is **rhythm analysis** — the observation that GPU workloads have temporal structure. Some kernels are invoked in bursts, others follow diurnal patterns, and others produce cascading fan-out. By tracking assignment history, the fleet coordinator can identify hotspots and predict where load will concentrate before it happens.
+- [Background](#background)
+- [How It Works](#how-it-works)
+  - [Agent Discovery & Capability Negotiation](#agent-discovery--capability-negotiation)
+  - [Workload Distribution](#workload-distribution)
+  - [Rhythm-Based Optimization](#rhythm-based-optimization)
+- [Architecture Overview](#architecture-overview)
+- [Applications](#applications)
+- [Getting Started](#getting-started)
+- [Related Projects](#related-projects)
+- [License](#license)
+
+---
+
+## Background
+
+Modern GPU computing is no longer confined to a single device. As model sizes grow and inference pipelines demand ever-lower latency, workloads must fan out across heterogeneous clusters of accelerators—each with different compute capabilities, memory capacities, and availability windows. The challenge is not merely *running* code on a GPU; it is *orchestrating* thousands of cooperative agents across dozens of nodes without drowning in coordination overhead.
+
+**oxide-fleet** was born from the [Flux→PTX](https://github.com/SuperInstance/SuperInstance) ecosystem, an ambitious effort to compile high-level agentic intent (Flux bytecode) directly to NVIDIA PTX and execute it on distributed GPUs. In that stack, `oxide-fleet` sits at the coordination layer: it discovers agents, negotiates their capabilities, distributes work requests, and continuously optimizes the fleet-wide workload rhythm.
+
+The crate is intentionally minimal. It does not speak CUDA directly, nor does it manage network sockets. Instead, it provides the *decision engine*—the data structures and algorithms that turn a chaotic bag of GPU-enabled agents into an organized, queryable, and load-balanced fleet.
+
+---
 
 ## How It Works
 
-At the center of `oxide-fleet` is the `FleetCoordinator`, which maintains a registry of `FleetAgent`s. Each agent advertises:
+At its heart, `oxide-fleet` is a stateful coordinator. You register `FleetAgent` instances with it, each advertising a set of `Capability` values and a collection of `GpuDevice` descriptors. When a `WorkRequest` arrives, the coordinator discovers eligible agents, scores them by current load, and produces an `Assignment`. Over time, it accumulates a history of assignments and can analyze that history to detect hotspots and load imbalance.
 
-- **Capabilities**: What it can do (compile Flux, execute kernels, load constructs, sync CRDTs, or custom capabilities).
-- **GPU devices**: Compute capability, VRAM, tensor core availability, availability bit.
-- **Status**: Online, Busy, Offline, or Draining.
-- **Workload**: Running kernels, pending tasks, GPU utilization, memory usage.
+### Agent Discovery & Capability Negotiation
 
-When a `WorkRequest` arrives, the coordinator runs a multi-stage filter:
+Agents are not anonymous workers. Each one carries a typed capability vector:
 
-1. **Capability discovery**: Only agents that satisfy all required capabilities are considered.
-2. **GPU filtering**: Available GPUs must meet `min_compute_capability` and `min_vram_mb`.
-3. **Load balancing**: Among qualified agents, the one with the lowest `(running_kernels, gpu_utilization)` is chosen.
+- **`FluxCompiler`** — the agent can compile Flux bytecode to an intermediate representation.
+- **`KernelExecutor { min_sm }`** — the agent can execute PTX kernels, and it advertises the minimum SM (Streaming Multiprocessor) version it supports.
+- **`ConstructLoader`** — the agent can dynamically load computational constructs from external sources (e.g., git-backed compute graphs).
+- **`CrdtSync`** — the agent can participate in CRDT-based state synchronization.
+- **`Custom(String)`** — an open-ended escape hatch for domain-specific capabilities.
 
-The result is an `Assignment` that includes the chosen agent, GPU index, and a human-readable reason.
+Discovery is performed via set intersection: a work request declares which capabilities it requires, and the coordinator returns only those agents whose capability vectors are supersets of the request. For `KernelExecutor`, the coordinator performs a *semantic* match: an agent advertising `min_sm: 80` satisfies a request for `min_sm: 70`, but not the reverse. This subtle detail prevents kernels from being scheduled on hardware that cannot execute them.
 
-### Rhythm Analysis
+### Workload Distribution
 
-The coordinator maintains an `assignment_history`. Periodically, it runs `analyze_rhythm()` to compute:
+Once candidates are identified, the coordinator applies a multi-stage filter:
 
-- **Total assignments**: Volume of work flowing through the fleet.
-- **Unique agents**: How many distinct agents participated.
-- **Load imbalance**: Ratio of max assignments to average assignments per agent.
-- **Hotspots**: Agents receiving >1.5× the average load.
+1. **Status filter** — only `Online` agents are considered. Agents that are `Busy`, `Offline`, or `Draining` are skipped.
+2. **Hardware filter** — the agent must possess at least one GPU whose compute capability and VRAM meet or exceed the request's minimums, and that GPU must currently be available.
+3. **Load scoring** — remaining candidates are ranked by `(running_kernels, gpu_utilization_pct)`. The agent with the lowest tuple wins.
 
-These metrics enable predictive scaling. If one agent becomes a persistent hotspot, the fleet can preemptively drain it or spin up a replica.
+The result is a "best-fit" assignment that spreads work across the fleet rather than hammering the first capable agent. When the work completes, the caller informs the coordinator via `complete_work`, which removes the pending assignment and frees the GPU for future requests.
 
-## Experiments
+### Rhythm-Based Optimization
 
-The test suite encodes several experimental claims:
+Long-running fleets develop patterns. Some agents become hotspots; others sit under-utilized. `oxide-fleet` captures every assignment in an `assignment_history` and exposes `analyze_rhythm`, which computes:
 
-```rust
-#[test]
-fn test_prefers_lower_workload() {
-    // Verifies that work is routed away from busy agents.
-}
+- **Total assignments** — the raw throughput of the fleet.
+- **Unique agents touched** — a proxy for distribution breadth.
+- **Load imbalance ratio** — the maximum assignments received by any single agent divided by the per-agent average. A value of `1.0` is perfect balance; values above `1.5` indicate hotspots.
+- **Hotspot list** — the specific agent IDs that are receiving disproportionate load.
 
-#[test]
-fn test_rhythm_analysis() {
-    // Verifies that assignment history produces measurable load imbalance.
-}
+This analysis is intentionally lightweight. It runs in-memory, requires no external time-series database, and can be polled periodically by a control loop to trigger rebalancing actions—migrating queued work away from hotspots or spinning up new agents in the affected node pools.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     oxide-fleet                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │   FleetAgent │  │  WorkRequest │  │  FleetCoordinator │  │
+│  │  (discovery) │  │ (scheduling) │  │   (orchestration) │  │
+│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+│         │                 │                    │            │
+│         ▼                 ▼                    ▼            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │  Capability  │  │  Assignment  │  │  RhythmAnalysis  │  │
+│  │  negotiation │  │   decision   │  │   (hotspots)     │  │
+│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+              ┌───────────────────────────────┐
+              │   Flux→PTX Distributed Runtime │
+              │   (cuda-oxide / cudaclaw)      │
+              └───────────────────────────────┘
 ```
 
-A larger experiment: deploy 10 simulated agents with heterogeneous capabilities and submit 1,000 work requests drawn from a Pareto distribution. Expected results:
+The crate exposes a small, orthogonal API surface:
 
-- 99% of requests succeed if the fleet has aggregate capacity.
-- The busiest agent receives no more than 1.5× the average load.
-- Rhythm analysis identifies hotspots within 50 assignments.
+- **`FleetCoordinator`** — the central registry and scheduler.
+- **`FleetAgent`** / **`GpuDevice`** — hardware topology descriptors.
+- **`Capability`** — a strongly-typed capability taxonomy.
+- **`WorkRequest`** / **`WorkPriority`** — declarative job specifications.
+- **`Assignment`** — an immutable scheduling decision.
+- **`FleetStats`** / **`RhythmAnalysis`** — observability and optimization signals.
+- **`FleetError`** — structured error variants for every failure mode.
+
+All core types implement `Debug` and `Clone`, making them easy to serialize, log, or ferry across async boundaries.
+
+---
 
 ## Applications
 
-- **Heterogeneous GPU clusters**: Route H100-only kernels to H100 nodes, V100-compatible kernels anywhere.
-- **Compile farms**: Send Flux→PTX compilation to agents with `FluxCompiler` capability, execution to agents with `KernelExecutor`.
-- **Dynamic scaling**: Use rhythm analysis to trigger cluster autoscaling before queues build.
-- **Fleet-wide construct propagation**: Coordinate with `oxide-constructs` to deploy new kernels to the right subset of nodes.
-- **Failure isolation**: Mark agents as `Draining` to gracefully remove them without dropping in-flight work.
+While `oxide-fleet` was designed for the Flux→PTX stack, its abstraction level makes it suitable for any domain that needs capability-aware scheduling across a heterogeneous agent pool:
 
-## Open Questions
+- **Distributed inference serving** — Route prompt-processing jobs to nodes with tensor-core support and sufficient free VRAM.
+- **GPU-native agent swarms** — Coordinate thousands of lightweight agents executing on persistent CUDA kernels, each with distinct roles (compilation, execution, synchronization).
+- **Dynamic construct markets** — Load and unload computational "constructs" (kernels, compute graphs, model shards) from git-backed registries, scheduling them only on agents that advertise `ConstructLoader` capabilities.
+- **Heterogeneous cluster management** — Unify nodes with different GPU generations (e.g., A100s, H100s, RTX 4090s) behind a single scheduling policy that respects compute-capability differences.
+- **Research testbeds** — Rapidly prototype new scheduling heuristics (power-aware, thermal-aware, or cost-aware) by swapping the scoring logic inside `assign_work`.
 
-1. **Global optimality vs. local greediness**: The current scheduler is greedy. Under what conditions does greedy assignment produce globally suboptimal placements, and what is the computational cost of optimal assignment?
-2. **Multi-objective scheduling**: We optimize for load. What happens when we add latency, energy, or thermal objectives?
-3. **Predictive rhythm models**: Can we move from reactive hotspot detection to predictive autoregressive models of workload arrival?
-4. **Byzantine agents**: How do we prevent a malicious agent from advertising false capabilities and stealing work?
+---
 
-## Cross-Links
+## Getting Started
 
-- [SuperInstance agent-knowledge / FLEET-MAP.md](https://github.com/SuperInstance/agent-knowledge/blob/main/FLEET-MAP.md) — The 303-crate fleet geometry that `oxide-fleet` navigates.
-- [SuperInstance agent-knowledge / AGENT-TO-AGENT-PROTOCOL.md](https://github.com/SuperInstance/agent-knowledge/blob/main/AGENT-TO-AGENT-PROTOCOL.md) — Ternary signal protocol underlying fleet coordination.
-- [SuperInstance agent-knowledge / DEPLOYMENT-AND-OPERATIONS.md](https://github.com/SuperInstance/agent-knowledge/blob/main/DEPLOYMENT-AND-OPERATIONS.md) — How fleets are deployed at scale.
-- `oxide-constructs` — Constructs loaded into the fleet.
-- `oxide-circuit-breaker` — Protects the fleet from cascading kernel failures.
-- `oxide-canary` — Rolls out new kernel versions across the fleet safely.
+Add `oxide-fleet` to your `Cargo.toml`:
 
-## Quick Start
+```toml
+[dependencies]
+oxide-fleet = "0.1"
+```
+
+Register agents and schedule work:
 
 ```rust
-use oxide_fleet::{FleetCoordinator, FleetAgent, Capability, GpuDevice, WorkRequest, WorkPriority};
+use oxide_fleet::{FleetCoordinator, FleetAgent, Capability, GpuDevice, AgentStatus, WorkRequest, WorkPriority};
 
 let mut coord = FleetCoordinator::new();
+
 coord.register_agent(FleetAgent {
-    id: "gpu-node-1".into(),
-    node: "rack-4".into(),
-    capabilities: vec![Capability::KernelExecutor { min_sm: 80 }],
+    id: "node-a-gpu-0".into(),
+    node: "node-a".into(),
+    capabilities: vec![Capability::KernelExecutor { min_sm: 80 }, Capability::FluxCompiler],
     gpu_devices: vec![GpuDevice {
-        node_id: "rack-4".into(),
+        node_id: "node-a".into(),
         gpu_index: 0,
         compute_capability: 80,
-        vram_mb: 8192,
+        vram_mb: 40_960,
         has_tensor_cores: true,
         is_available: true,
     }],
     status: AgentStatus::Online,
-    workload: WorkloadInfo::default(),
+    workload: Default::default(),
 });
 
 let request = WorkRequest {
-    id: "attention-forward-42".into(),
+    id: "inference-batch-42".into(),
     required_capabilities: vec![Capability::KernelExecutor { min_sm: 80 }],
     min_compute_capability: 80,
-    min_vram_mb: 4096,
+    min_vram_mb: 8_192,
     priority: WorkPriority::High,
-    estimated_duration_ms: 150,
+    estimated_duration_ms: 500,
 };
 
-let assignment = coord.assign_work(&request).unwrap();
+let assignment = coord.assign_work(&request)?;
 println!("Assigned to {} on GPU {}", assignment.agent_id, assignment.gpu_index);
+
+// ... later, when the kernel finishes ...
+coord.complete_work(&request.id);
 ```
+
+Run the built-in tests to verify behavior:
+
+```bash
+cargo test
+```
+
+---
+
+## Related Projects
+
+- **[SuperInstance](https://github.com/SuperInstance/SuperInstance)** — The umbrella project for the Flux→PTX distributed GPU runtime. `oxide-fleet` is the coordination layer within that ecosystem.
+- **cuda-oxide** — The compiler pipeline that translates Pliron IR through NVVM and LLVM to PTX.
+- **cudaclaw** — The persistent-kernel runtime that executes agent logic directly on the GPU.
+
+---
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
