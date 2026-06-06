@@ -1,322 +1,120 @@
 # oxide-fleet
 
-Fleet coordination layer for the Flux→PTX distributed GPU runtime.
+> Distributed GPU orchestration through capability negotiation and rhythm-aware workload placement.
 
-`oxide-fleet` is the control plane that binds heterogeneous GPU agents into a single, addressable compute surface. It handles agent discovery by capability, work distribution with priority awareness, real-time status tracking, and rhythm-based workload optimization. If you are running a multi-node GPU cluster and need something between "manual SSH scripts" and "full Kubernetes," this is your layer.
+## Background Theory
 
----
+Modern GPU clusters are not homogeneous. A single datacenter may contain V100s, A100s, H100s, and edge-class GPUs, each with different compute capabilities, memory capacities, and specialized features. Treating them as identical resources leads to fragmentation, load imbalance, and failed kernel launches.
 
-## What This Crate Does
+The theoretical foundation of `oxide-fleet` is **capability-based resource allocation**. Instead of scheduling work to "a GPU," we schedule to "an agent that can compile Flux to PTX, has SM 8.0+, 8GB+ VRAM, and is currently online." This transforms scheduling from a naming problem into a constraint-satisfaction problem.
 
-In a distributed GPU system, you have nodes with different hardware generations, varying VRAM capacities, and heterogeneous capabilities—some agents compile Flux IR to PTX, others execute kernels, others synchronize state via CRDTs. `oxide-fleet` gives you a single `FleetCoordinator` that:
+A secondary foundation is **rhythm analysis** — the observation that GPU workloads have temporal structure. Some kernels are invoked in bursts, others follow diurnal patterns, and others produce cascading fan-out. By tracking assignment history, the fleet coordinator can identify hotspots and predict where load will concentrate before it happens.
 
-- Maintains a live registry of every agent and its GPU inventory
-- Matches work requests to agents based on **capabilities**, not just labels
-- Tracks agent lifecycle from `Online` → `Busy` → `Draining` → `Offline`
-- Prioritizes work across four explicit levels from `Low` to `Critical`
-- Detects load imbalance and hotspots through **rhythm analysis**
+## How It Works
 
-This is not a job queue. It is a placement engine with awareness of what your agents can actually do.
+At the center of `oxide-fleet` is the `FleetCoordinator`, which maintains a registry of `FleetAgent`s. Each agent advertises:
 
----
+- **Capabilities**: What it can do (compile Flux, execute kernels, load constructs, sync CRDTs, or custom capabilities).
+- **GPU devices**: Compute capability, VRAM, tensor core availability, availability bit.
+- **Status**: Online, Busy, Offline, or Draining.
+- **Workload**: Running kernels, pending tasks, GPU utilization, memory usage.
 
-## Agent Discovery by Capabilities
+When a `WorkRequest` arrives, the coordinator runs a multi-stage filter:
 
-Agents are not identified by static hostnames. They advertise **capabilities**—structured descriptors of what they can provide.
+1. **Capability discovery**: Only agents that satisfy all required capabilities are considered.
+2. **GPU filtering**: Available GPUs must meet `min_compute_capability` and `min_vram_mb`.
+3. **Load balancing**: Among qualified agents, the one with the lowest `(running_kernels, gpu_utilization)` is chosen.
 
-```rust
-use oxide_fleet::{Capability, FleetAgent, GpuDevice, AgentStatus, WorkloadInfo};
+The result is an `Assignment` that includes the chosen agent, GPU index, and a human-readable reason.
 
-let agent = FleetAgent {
-    id: "node-c-01".to_string(),
-    node: "cuda-rack-3".to_string(),
-    capabilities: vec![
-        Capability::FluxCompiler,
-        Capability::KernelExecutor { min_sm: 80 },  // SM 8.0+
-        Capability::CrdtSync,
-        Capability::Custom("nvlink-mesh".to_string()),
-    ],
-    gpu_devices: vec![
-        GpuDevice {
-            node_id: "cuda-rack-3".to_string(),
-            gpu_index: 0,
-            compute_capability: 80,
-            vram_mb: 24_576,        // 24 GB
-            has_tensor_cores: true,
-            is_available: true,
-        },
-    ],
-    status: AgentStatus::Online,
-    workload: WorkloadInfo::default(),
-};
-```
+### Rhythm Analysis
 
-Capabilities are typed:
+The coordinator maintains an `assignment_history`. Periodically, it runs `analyze_rhythm()` to compute:
 
-| Capability | Meaning |
-|---|---|
-| `FluxCompiler` | Can compile Flux IR down to PTX |
-| `KernelExecutor { min_sm }` | Can launch PTX kernels; requires at least `min_sm` streaming multiprocessors |
-| `ConstructLoader` | Can load constructs from git-backed storage |
-| `CrdtSync` | Can participate in CRDT-based state synchronization |
-| `Custom(s)` | Arbitrary domain-specific capability |
+- **Total assignments**: Volume of work flowing through the fleet.
+- **Unique agents**: How many distinct agents participated.
+- **Load imbalance**: Ratio of max assignments to average assignments per agent.
+- **Hotspots**: Agents receiving >1.5× the average load.
 
-Discovery uses **subsumption matching**: a `KernelExecutor { min_sm: 80 }` request will match an agent advertising `min_sm: 90`, but not one advertising `min_sm: 70`.
+These metrics enable predictive scaling. If one agent becomes a persistent hotspot, the fleet can preemptively drain it or spin up a replica.
+
+## Experiments
+
+The test suite encodes several experimental claims:
 
 ```rust
-use oxide_fleet::{FleetCoordinator, Capability};
+#[test]
+fn test_prefers_lower_workload() {
+    // Verifies that work is routed away from busy agents.
+}
 
-let mut fleet = FleetCoordinator::new();
-fleet.register_agent(agent);
-
-// Find every agent that can execute kernels on SM 8.0+ hardware
-let capable = fleet.discover(&[
-    Capability::KernelExecutor { min_sm: 80 },
-]);
-```
-
----
-
-## Work Request System with Priorities
-
-Work is submitted as a `WorkRequest`, not a raw binary blob. The request carries both **functional requirements** (capabilities, minimum compute capability, minimum VRAM) and **operational metadata** (priority, estimated duration).
-
-```rust
-use oxide_fleet::{WorkRequest, WorkPriority, Capability};
-
-let req = WorkRequest {
-    id: "inference-batch-7721".to_string(),
-    required_capabilities: vec![
-        Capability::KernelExecutor { min_sm: 80 },
-        Capability::CrdtSync,
-    ],
-    min_compute_capability: 80,
-    min_vram_mb: 12_288,          // 12 GB
-    priority: WorkPriority::High,
-    estimated_duration_ms: 45_000,
-};
-```
-
-Priority levels are ordered and comparable:
-
-| Level | Ordinal | Typical Use |
-|---|---|---|
-| `Low` | 0 | Backfill, batch preprocessing, cache warming |
-| `Normal` | 1 | Standard training iterations, routine inference |
-| `High` | 2 | Latency-sensitive inference, checkpoint commits |
-| `Critical` | 3 | Failure recovery, control-plane heartbeats, emergency checkpointing |
-
-The coordinator currently uses priority to inform placement decisions in the caller layer. The `WorkPriority` type implements `Ord`, so you can build your own priority-queue wrapper on top without friction.
-
----
-
-## Assigning Work
-
-`assign_work` is greedy but workload-aware. It filters by capability, then by status (`Online` only), then by GPU fit, and finally selects the agent with the lowest `(running_kernels, gpu_utilization_pct)` tuple.
-
-```rust
-let assignment = fleet.assign_work(&req)?;
-println!(
-    "Assigned {} to agent {} on GPU {}. Reason: {}",
-    assignment.work_id,
-    assignment.agent_id,
-    assignment.gpu_index,
-    assignment.reason
-);
-// "Assigned inference-batch-7721 to agent node-c-01 on GPU 0. \
-//  Reason: best fit: 2 kernels running, 34% util"
-```
-
-When work completes, call `complete_work` to remove the assignment from the pending set:
-
-```rust
-let finished = fleet.complete_work("inference-batch-7721");
-assert_eq!(finished.unwrap().agent_id, "node-c-01");
-```
-
-If no agent satisfies the request, `assign_work` returns `FleetError::NoAvailableAgent` immediately. There is no hidden queuing—failures are explicit and observable.
-
----
-
-## Agent Status Tracking
-
-Agents move through a finite state of statuses:
-
-| Status | Meaning |
-|---|---|
-| `Online` | Agent is healthy and accepting work |
-| `Busy { task }` | Agent is currently occupied with a named task |
-| `Offline` | Agent is unreachable—no work will be assigned |
-| `Draining` | Agent is finishing in-flight work; new assignments are rejected |
-
-`Draining` is the graceful off-ramp. Use it when you need to reboot a node, update drivers, or evacuate a rack. The coordinator still counts a draining agent as present, but `assign_work` will skip it because its status is no longer `Online`.
-
-```rust
-use oxide_fleet::{FleetAgent, AgentStatus};
-
-let mut agent = make_agent("node-c-01", 80, 24_576);
-agent.status = AgentStatus::Draining;
-fleet.register_agent(agent);  // Existing registrations are overwritten
-```
-
-The `WorkloadInfo` struct carries runtime telemetry:
-
-```rust
-WorkloadInfo {
-    running_kernels: 4,
-    pending_tasks: 1,
-    gpu_utilization_pct: 67,
-    memory_used_mb: 19_200,
+#[test]
+fn test_rhythm_analysis() {
+    // Verifies that assignment history produces measurable load imbalance.
 }
 ```
 
-Feed this from your node-level metrics daemon. The coordinator does not poll—push updates into `FleetAgent` and re-register.
+A larger experiment: deploy 10 simulated agents with heterogeneous capabilities and submit 1,000 work requests drawn from a Pareto distribution. Expected results:
 
----
+- 99% of requests succeed if the fleet has aggregate capacity.
+- The busiest agent receives no more than 1.5× the average load.
+- Rhythm analysis identifies hotspots within 50 assignments.
 
-## Rhythm Analysis
+## Applications
 
-After work has been flowing for a while, you need to know whether your fleet is actually balanced or whether one agent is eating all the traffic. `analyze_rhythm` returns a `RhythmAnalysis` that surfaces:
+- **Heterogeneous GPU clusters**: Route H100-only kernels to H100 nodes, V100-compatible kernels anywhere.
+- **Compile farms**: Send Flux→PTX compilation to agents with `FluxCompiler` capability, execution to agents with `KernelExecutor`.
+- **Dynamic scaling**: Use rhythm analysis to trigger cluster autoscaling before queues build.
+- **Fleet-wide construct propagation**: Coordinate with `oxide-constructs` to deploy new kernels to the right subset of nodes.
+- **Failure isolation**: Mark agents as `Draining` to gracefully remove them without dropping in-flight work.
 
-- **Total assignments** — how many placements have been recorded
-- **Unique agents touched** — coverage of the fleet
-- **Load imbalance ratio** — max assignments per agent divided by the mean; 1.0 is perfectly uniform
-- **Hotspots** — agents receiving >1.5× the average assignment count
+## Open Questions
 
-```rust
-let rhythm = fleet.analyze_rhythm();
+1. **Global optimality vs. local greediness**: The current scheduler is greedy. Under what conditions does greedy assignment produce globally suboptimal placements, and what is the computational cost of optimal assignment?
+2. **Multi-objective scheduling**: We optimize for load. What happens when we add latency, energy, or thermal objectives?
+3. **Predictive rhythm models**: Can we move from reactive hotspot detection to predictive autoregressive models of workload arrival?
+4. **Byzantine agents**: How do we prevent a malicious agent from advertising false capabilities and stealing work?
 
-println!("Assignments: {} across {} agents", rhythm.total_assignments, rhythm.unique_agents);
-println!("Load imbalance: {:.2}", rhythm.load_imbalance);
-println!("Hotspots: {:?}", rhythm.hotspots);
-```
+## Cross-Links
 
-Example output after 10,000 inference requests across 8 nodes:
-
-```text
-Assignments: 10000 across 8 agents
-Load imbalance: 2.34
-Hotspots: ["node-c-01", "node-c-04"]
-```
-
-A ratio above ~1.5 is a signal to investigate: tensor-core affinity, NVLink topology, or stale workload telemetry causing the scheduler to over-prefer certain nodes. Rhythm analysis gives you the data to act, not just observe.
-
----
-
-## FleetStats Overview
-
-Call `stats()` at any time for a point-in-time snapshot of the fleet:
-
-```rust
-let s = fleet.stats();
-println!("Agents: {}/{} online", s.online_agents, s.total_agents);
-println!("GPUs: {}/{} available", s.available_gpus, s.total_gpus);
-println!("Kernels running: {}", s.running_kernels);
-println!("Pending assignments: {}", s.pending_assignments);
-```
-
-| Field | Description |
-|---|---|
-| `total_agents` | Registered agents |
-| `online_agents` | Agents currently in `Online` status |
-| `total_gpus` | GPUs across all registered agents |
-| `available_gpus` | GPUs marked `is_available == true` |
-| `running_kernels` | Sum of `workload.running_kernels` fleet-wide |
-| `pending_assignments` | Active assignments not yet completed |
-
-Use `FleetStats` for dashboards, health-check endpoints, and autoscaling triggers.
-
----
-
-## Relationship to the Agent Ecosystem
-
-`oxide-fleet` does not exist in a vacuum. It sits at the center of three companion crates:
-
-- **agent-handshake** — Capability negotiation and secure joining. When a new node boots, it runs the handshake protocol to prove it can provide the capabilities it claims. `oxide-fleet` trusts the resulting `FleetAgent` descriptor and inserts it into the coordinator.
-- **agent-manifest** — Declarative agent configuration. The manifest specifies which capabilities an agent should advertise, which GPUs to expose, and node metadata. Fleet operators edit manifests; the agent runtime applies them; `oxide-fleet` consumes the resulting agent records.
-- **agent-rhythm** — Workload-pattern optimization. While `oxide-fleet` provides the `analyze_rhythm` diagnostic, `agent-rhythm` consumes that output and generates concrete rebalancing recommendations—migrating kernels, adjusting affinity masks, or suggesting fleet topology changes.
-
-In short: **handshake gets you in, manifest tells you what you are, fleet moves work to you, and rhythm tells you whether the movement is healthy.**
-
----
-
-## Error Handling
-
-All placement failures are explicit:
-
-```rust
-pub enum FleetError {
-    NoAvailableAgent,                        // No agent matched constraints
-    AgentNotFound(String),                   // Dereference of unknown agent ID
-    CapabilityMismatch { agent, required },  // Capability subsumption failed
-    GpuUnavailable { agent, gpu_index },     // Target GPU marked unavailable
-}
-```
-
-`FleetError` implements `std::error::Error` and `Display`. Propagate it with `?` or match on it to decide whether to retry, relax constraints, or page an operator.
-
----
+- [SuperInstance agent-knowledge / FLEET-MAP.md](https://github.com/SuperInstance/agent-knowledge/blob/main/FLEET-MAP.md) — The 303-crate fleet geometry that `oxide-fleet` navigates.
+- [SuperInstance agent-knowledge / AGENT-TO-AGENT-PROTOCOL.md](https://github.com/SuperInstance/agent-knowledge/blob/main/AGENT-TO-AGENT-PROTOCOL.md) — Ternary signal protocol underlying fleet coordination.
+- [SuperInstance agent-knowledge / DEPLOYMENT-AND-OPERATIONS.md](https://github.com/SuperInstance/agent-knowledge/blob/main/DEPLOYMENT-AND-OPERATIONS.md) — How fleets are deployed at scale.
+- `oxide-constructs` — Constructs loaded into the fleet.
+- `oxide-circuit-breaker` — Protects the fleet from cascading kernel failures.
+- `oxide-canary` — Rolls out new kernel versions across the fleet safely.
 
 ## Quick Start
 
 ```rust
-use oxide_fleet::*;
+use oxide_fleet::{FleetCoordinator, FleetAgent, Capability, GpuDevice, WorkRequest, WorkPriority};
 
-fn main() -> Result<(), FleetError> {
-    let mut fleet = FleetCoordinator::new();
+let mut coord = FleetCoordinator::new();
+coord.register_agent(FleetAgent {
+    id: "gpu-node-1".into(),
+    node: "rack-4".into(),
+    capabilities: vec![Capability::KernelExecutor { min_sm: 80 }],
+    gpu_devices: vec![GpuDevice {
+        node_id: "rack-4".into(),
+        gpu_index: 0,
+        compute_capability: 80,
+        vram_mb: 8192,
+        has_tensor_cores: true,
+        is_available: true,
+    }],
+    status: AgentStatus::Online,
+    workload: WorkloadInfo::default(),
+});
 
-    // Register two nodes
-    fleet.register_agent(FleetAgent {
-        id: "gpu-01".into(),
-        node: "rack-a".into(),
-        capabilities: vec![
-            Capability::KernelExecutor { min_sm: 80 },
-            Capability::FluxCompiler,
-        ],
-        gpu_devices: vec![GpuDevice {
-            node_id: "rack-a".into(),
-            gpu_index: 0,
-            compute_capability: 80,
-            vram_mb: 24_576,
-            has_tensor_cores: true,
-            is_available: true,
-        }],
-        status: AgentStatus::Online,
-        workload: WorkloadInfo::default(),
-    });
+let request = WorkRequest {
+    id: "attention-forward-42".into(),
+    required_capabilities: vec![Capability::KernelExecutor { min_sm: 80 }],
+    min_compute_capability: 80,
+    min_vram_mb: 4096,
+    priority: WorkPriority::High,
+    estimated_duration_ms: 150,
+};
 
-    // Find compilers
-    let compilers = fleet.discover(&[Capability::FluxCompiler]);
-    println!("Compilers available: {}", compilers.len());
-
-    // Submit critical work
-    let job = WorkRequest {
-        id: "compile-pass-7".into(),
-        required_capabilities: vec![Capability::FluxCompiler],
-        min_compute_capability: 80,
-        min_vram_mb: 4096,
-        priority: WorkPriority::Critical,
-        estimated_duration_ms: 120_000,
-    };
-
-    let assignment = fleet.assign_work(&job)?;
-    println!("Assigned to {} (GPU {})", assignment.agent_id, assignment.gpu_index);
-
-    // Later...
-    fleet.complete_work(&job.id);
-
-    // Check fleet health
-    let stats = fleet.stats();
-    let rhythm = fleet.analyze_rhythm();
-    println!("Fleet: {:?}", stats);
-    println!("Rhythm: {:?}", rhythm);
-
-    Ok(())
-}
+let assignment = coord.assign_work(&request).unwrap();
+println!("Assigned to {} on GPU {}", assignment.agent_id, assignment.gpu_index);
 ```
-
----
-
-## License
-
-Apache-2.0
